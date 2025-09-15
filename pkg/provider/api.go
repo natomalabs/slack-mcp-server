@@ -2,9 +2,7 @@ package provider
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io/ioutil"
 	"os"
 	"strings"
 
@@ -17,8 +15,8 @@ import (
 	"golang.org/x/time/rate"
 )
 
-const usersNotReadyMsg = "users cache is not ready yet, sync process is still running... please wait"
-const channelsNotReadyMsg = "channels cache is not ready yet, sync process is still running... please wait"
+const usersNotReadyMsg = "users data is not ready yet, loading process is still running... please wait"
+const channelsNotReadyMsg = "channels data is not ready yet, loading process is still running... please wait"
 const defaultUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 
 var AllChanTypes = []string{"mpim", "im", "public_channel", "private_channel"}
@@ -91,12 +89,10 @@ type ApiProvider struct {
 
 	users      map[string]slack.User
 	usersInv   map[string]string
-	usersCache string
 	usersReady bool
 
 	channels      map[string]Channel
 	channelsInv   map[string]string
-	channelsCache string
 	channelsReady bool
 }
 
@@ -320,16 +316,6 @@ func newWithXOXP(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 		err    error
 	)
 
-	usersCache := os.Getenv("SLACK_MCP_USERS_CACHE")
-	if usersCache == "" {
-		usersCache = ".users_cache.json"
-	}
-
-	channelsCache := os.Getenv("SLACK_MCP_CHANNELS_CACHE")
-	if channelsCache == "" {
-		channelsCache = ".channels_cache.json"
-	}
-
 	if os.Getenv("SLACK_MCP_XOXP_TOKEN") == "demo" || (os.Getenv("SLACK_MCP_XOXC_TOKEN") == "demo" && os.Getenv("SLACK_MCP_XOXD_TOKEN") == "demo") {
 		logger.Info("Demo credentials are set, skip.")
 	} else {
@@ -346,13 +332,11 @@ func newWithXOXP(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 
 		rateLimiter: limiter.Tier2.Limiter(),
 
-		users:      make(map[string]slack.User),
-		usersInv:   map[string]string{},
-		usersCache: usersCache,
+		users:    make(map[string]slack.User),
+		usersInv: map[string]string{},
 
-		channels:      make(map[string]Channel),
-		channelsInv:   map[string]string{},
-		channelsCache: channelsCache,
+		channels:    make(map[string]Channel),
+		channelsInv: map[string]string{},
 	}
 }
 
@@ -362,16 +346,6 @@ func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 		err    error
 	)
 
-	usersCache := os.Getenv("SLACK_MCP_USERS_CACHE")
-	if usersCache == "" {
-		usersCache = ".users_cache.json"
-	}
-
-	channelsCache := os.Getenv("SLACK_MCP_CHANNELS_CACHE")
-	if channelsCache == "" {
-		channelsCache = ".channels_cache_v2.json"
-	}
-
 	if os.Getenv("SLACK_MCP_XOXP_TOKEN") == "demo" || (os.Getenv("SLACK_MCP_XOXC_TOKEN") == "demo" && os.Getenv("SLACK_MCP_XOXD_TOKEN") == "demo") {
 		logger.Info("Demo credentials are set, skip.")
 	} else {
@@ -388,41 +362,19 @@ func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 
 		rateLimiter: limiter.Tier2.Limiter(),
 
-		users:      make(map[string]slack.User),
-		usersInv:   map[string]string{},
-		usersCache: usersCache,
+		users:    make(map[string]slack.User),
+		usersInv: map[string]string{},
 
-		channels:      make(map[string]Channel),
-		channelsInv:   map[string]string{},
-		channelsCache: channelsCache,
+		channels:    make(map[string]Channel),
+		channelsInv: map[string]string{},
 	}
 }
 
 func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 	var (
-		list         []slack.User
 		usersCounter = 0
 		optionLimit  = slack.GetUsersOptionLimit(1000)
 	)
-
-	if data, err := ioutil.ReadFile(ap.usersCache); err == nil {
-		var cachedUsers []slack.User
-		if err := json.Unmarshal(data, &cachedUsers); err != nil {
-			ap.logger.Warn("Failed to unmarshal users cache, will refetch",
-				zap.String("cache_file", ap.usersCache),
-				zap.Error(err))
-		} else {
-			for _, u := range cachedUsers {
-				ap.users[u.ID] = u
-				ap.usersInv[u.Name] = u.ID
-			}
-			ap.logger.Info("Loaded users from cache",
-				zap.Int("count", len(cachedUsers)),
-				zap.String("cache_file", ap.usersCache))
-			ap.usersReady = true
-			return nil
-		}
-	}
 
 	users, err := ap.client.GetUsersContext(ctx,
 		optionLimit,
@@ -430,8 +382,6 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 	if err != nil {
 		ap.logger.Error("Failed to fetch users", zap.Error(err))
 		return err
-	} else {
-		list = append(list, users...)
 	}
 
 	for _, user := range users {
@@ -440,33 +390,20 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		usersCounter++
 	}
 
-	users, err = ap.GetSlackConnect(ctx)
+	slackConnectUsers, err := ap.GetSlackConnect(ctx)
 	if err != nil {
 		ap.logger.Error("Failed to fetch users from Slack Connect", zap.Error(err))
 		return err
-	} else {
-		list = append(list, users...)
 	}
 
-	for _, user := range users {
+	for _, user := range slackConnectUsers {
 		ap.users[user.ID] = user
 		ap.usersInv[user.Name] = user.ID
 		usersCounter++
 	}
 
-	if data, err := json.MarshalIndent(list, "", "  "); err != nil {
-		ap.logger.Error("Failed to marshal users for cache", zap.Error(err))
-	} else {
-		if err := ioutil.WriteFile(ap.usersCache, data, 0644); err != nil {
-			ap.logger.Error("Failed to write cache file",
-				zap.String("cache_file", ap.usersCache),
-				zap.Error(err))
-		} else {
-			ap.logger.Info("Wrote users to cache",
-				zap.Int("count", usersCounter),
-				zap.String("cache_file", ap.usersCache))
-		}
-	}
+	ap.logger.Info("Loaded users from API",
+		zap.Int("count", usersCounter))
 
 	ap.usersReady = true
 
@@ -474,40 +411,10 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 }
 
 func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
-	if data, err := ioutil.ReadFile(ap.channelsCache); err == nil {
-		var cachedChannels []Channel
-		if err := json.Unmarshal(data, &cachedChannels); err != nil {
-			ap.logger.Warn("Failed to unmarshal channels cache, will refetch",
-				zap.String("cache_file", ap.channelsCache),
-				zap.Error(err))
-		} else {
-			for _, c := range cachedChannels {
-				ap.channels[c.ID] = c
-				ap.channelsInv[c.Name] = c.ID
-			}
-			ap.logger.Info("Loaded channels from cache",
-				zap.Int("count", len(cachedChannels)),
-				zap.String("cache_file", ap.channelsCache))
-			ap.channelsReady = true
-			return nil
-		}
-	}
-
 	channels := ap.GetChannels(ctx, AllChanTypes)
 
-	if data, err := json.MarshalIndent(channels, "", "  "); err != nil {
-		ap.logger.Error("Failed to marshal channels for cache", zap.Error(err))
-	} else {
-		if err := ioutil.WriteFile(ap.channelsCache, data, 0644); err != nil {
-			ap.logger.Error("Failed to write cache file",
-				zap.String("cache_file", ap.channelsCache),
-				zap.Error(err))
-		} else {
-			ap.logger.Info("Wrote channels to cache",
-				zap.Int("count", len(channels)),
-				zap.String("cache_file", ap.channelsCache))
-		}
-	}
+	ap.logger.Info("Loaded channels from API",
+		zap.Int("count", len(channels)))
 
 	ap.channelsReady = true
 

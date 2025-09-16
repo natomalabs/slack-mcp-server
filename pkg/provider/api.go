@@ -2,9 +2,7 @@ package provider
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io/ioutil"
 	"os"
 	"strings"
 
@@ -91,13 +89,13 @@ type ApiProvider struct {
 
 	users      map[string]slack.User
 	usersInv   map[string]string
-	usersCache string
 	usersReady bool
 
 	channels      map[string]Channel
 	channelsInv   map[string]string
-	channelsCache string
 	channelsReady bool
+
+	redisClient *RedisClient
 }
 
 func NewMCPSlackClient(authProvider auth.Provider, logger *zap.Logger) (*MCPSlackClient, error) {
@@ -320,14 +318,12 @@ func newWithXOXP(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 		err    error
 	)
 
-	usersCache := os.Getenv("SLACK_MCP_USERS_CACHE")
-	if usersCache == "" {
-		usersCache = ".users_cache.json"
-	}
-
-	channelsCache := os.Getenv("SLACK_MCP_CHANNELS_CACHE")
-	if channelsCache == "" {
-		channelsCache = ".channels_cache.json"
+	var redisClient *RedisClient
+	if os.Getenv("REDIS_ADDR") != "" || os.Getenv("REDIS_PASSWORD") != "" || os.Getenv("REDIS_DB") != "" {
+		redisClient, err = NewRedisClient(logger)
+		if err != nil {
+			logger.Fatal("Failed to create Redis client", zap.Error(err))
+		}
 	}
 
 	if os.Getenv("SLACK_MCP_XOXP_TOKEN") == "demo" || (os.Getenv("SLACK_MCP_XOXC_TOKEN") == "demo" && os.Getenv("SLACK_MCP_XOXD_TOKEN") == "demo") {
@@ -348,11 +344,11 @@ func newWithXOXP(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 
 		users:      make(map[string]slack.User),
 		usersInv:   map[string]string{},
-		usersCache: usersCache,
 
 		channels:      make(map[string]Channel),
 		channelsInv:   map[string]string{},
-		channelsCache: channelsCache,
+
+		redisClient: redisClient,
 	}
 }
 
@@ -362,14 +358,12 @@ func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 		err    error
 	)
 
-	usersCache := os.Getenv("SLACK_MCP_USERS_CACHE")
-	if usersCache == "" {
-		usersCache = ".users_cache.json"
-	}
-
-	channelsCache := os.Getenv("SLACK_MCP_CHANNELS_CACHE")
-	if channelsCache == "" {
-		channelsCache = ".channels_cache_v2.json"
+	var redisClient *RedisClient
+	if os.Getenv("REDIS_ADDR") != "" || os.Getenv("REDIS_PASSWORD") != "" || os.Getenv("REDIS_DB") != "" {
+		redisClient, err = NewRedisClient(logger)
+		if err != nil {
+			logger.Fatal("Failed to create Redis client", zap.Error(err))
+		}
 	}
 
 	if os.Getenv("SLACK_MCP_XOXP_TOKEN") == "demo" || (os.Getenv("SLACK_MCP_XOXC_TOKEN") == "demo" && os.Getenv("SLACK_MCP_XOXD_TOKEN") == "demo") {
@@ -390,11 +384,11 @@ func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 
 		users:      make(map[string]slack.User),
 		usersInv:   map[string]string{},
-		usersCache: usersCache,
 
 		channels:      make(map[string]Channel),
 		channelsInv:   map[string]string{},
-		channelsCache: channelsCache,
+
+		redisClient: redisClient,
 	}
 }
 
@@ -405,20 +399,27 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		optionLimit  = slack.GetUsersOptionLimit(1000)
 	)
 
-	if data, err := ioutil.ReadFile(ap.usersCache); err == nil {
-		var cachedUsers []slack.User
-		if err := json.Unmarshal(data, &cachedUsers); err != nil {
-			ap.logger.Warn("Failed to unmarshal users cache, will refetch",
-				zap.String("cache_file", ap.usersCache),
-				zap.Error(err))
-		} else {
+	// Get team ID for cache partitioning
+	authResp, err := ap.client.AuthTest()
+	if err != nil {
+		ap.logger.Error("Failed to get auth test for team ID", zap.Error(err))
+		return err
+	}
+	teamID := authResp.TeamID
+
+	// Try to load from Redis cache first
+	if ap.redisClient != nil {
+		cachedUsers, err := ap.redisClient.GetUsers(ctx, teamID)
+		if err != nil {
+			ap.logger.Warn("Failed to get users from Redis cache", zap.Error(err))
+		} else if cachedUsers != nil {
 			for _, u := range cachedUsers {
 				ap.users[u.ID] = u
 				ap.usersInv[u.Name] = u.ID
 			}
-			ap.logger.Info("Loaded users from cache",
-				zap.Int("count", len(cachedUsers)),
-				zap.String("cache_file", ap.usersCache))
+			ap.logger.Info("Loaded users from Redis cache",
+				zap.String("team_id", teamID),
+				zap.Int("count", len(cachedUsers)))
 			ap.usersReady = true
 			return nil
 		}
@@ -454,17 +455,12 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		usersCounter++
 	}
 
-	if data, err := json.MarshalIndent(list, "", "  "); err != nil {
-		ap.logger.Error("Failed to marshal users for cache", zap.Error(err))
-	} else {
-		if err := ioutil.WriteFile(ap.usersCache, data, 0644); err != nil {
-			ap.logger.Error("Failed to write cache file",
-				zap.String("cache_file", ap.usersCache),
+	// Cache to Redis
+	if ap.redisClient != nil {
+		if err := ap.redisClient.SetUsers(ctx, teamID, list); err != nil {
+			ap.logger.Error("Failed to cache users to Redis",
+				zap.String("team_id", teamID),
 				zap.Error(err))
-		} else {
-			ap.logger.Info("Wrote users to cache",
-				zap.Int("count", usersCounter),
-				zap.String("cache_file", ap.usersCache))
 		}
 	}
 
@@ -474,20 +470,27 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 }
 
 func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
-	if data, err := ioutil.ReadFile(ap.channelsCache); err == nil {
-		var cachedChannels []Channel
-		if err := json.Unmarshal(data, &cachedChannels); err != nil {
-			ap.logger.Warn("Failed to unmarshal channels cache, will refetch",
-				zap.String("cache_file", ap.channelsCache),
-				zap.Error(err))
-		} else {
+	// Get team ID for cache partitioning
+	authResp, err := ap.client.AuthTest()
+	if err != nil {
+		ap.logger.Error("Failed to get auth test for team ID", zap.Error(err))
+		return err
+	}
+	teamID := authResp.TeamID
+
+	// Try to load from Redis cache first
+	if ap.redisClient != nil {
+		cachedChannels, err := ap.redisClient.GetChannels(ctx, teamID)
+		if err != nil {
+			ap.logger.Warn("Failed to get channels from Redis cache", zap.Error(err))
+		} else if cachedChannels != nil {
 			for _, c := range cachedChannels {
 				ap.channels[c.ID] = c
 				ap.channelsInv[c.Name] = c.ID
 			}
-			ap.logger.Info("Loaded channels from cache",
-				zap.Int("count", len(cachedChannels)),
-				zap.String("cache_file", ap.channelsCache))
+			ap.logger.Info("Loaded channels from Redis cache",
+				zap.String("team_id", teamID),
+				zap.Int("count", len(cachedChannels)))
 			ap.channelsReady = true
 			return nil
 		}
@@ -495,17 +498,12 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 
 	channels := ap.GetChannels(ctx, AllChanTypes)
 
-	if data, err := json.MarshalIndent(channels, "", "  "); err != nil {
-		ap.logger.Error("Failed to marshal channels for cache", zap.Error(err))
-	} else {
-		if err := ioutil.WriteFile(ap.channelsCache, data, 0644); err != nil {
-			ap.logger.Error("Failed to write cache file",
-				zap.String("cache_file", ap.channelsCache),
+	// Cache to Redis
+	if ap.redisClient != nil {
+		if err := ap.redisClient.SetChannels(ctx, teamID, channels); err != nil {
+			ap.logger.Error("Failed to cache channels to Redis",
+				zap.String("team_id", teamID),
 				zap.Error(err))
-		} else {
-			ap.logger.Info("Wrote channels to cache",
-				zap.Int("count", len(channels)),
-				zap.String("cache_file", ap.channelsCache))
 		}
 	}
 

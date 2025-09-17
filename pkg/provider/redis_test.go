@@ -12,7 +12,7 @@ import (
 	"go.uber.org/zap/zaptest"
 )
 
-func setupTestRedis(t *testing.T) (*RedisClient, redismock.ClientMock, func()) {
+func setupTestRedis(t *testing.T, teamID string) (*RedisClient, redismock.ClientMock, func()) {
 	logger := zaptest.NewLogger(t)
 
 	rdb, mock := redismock.NewClientMock()
@@ -20,6 +20,7 @@ func setupTestRedis(t *testing.T) (*RedisClient, redismock.ClientMock, func()) {
 	client := &RedisClient{
 		client: rdb,
 		logger: logger,
+		teamID: teamID,
 	}
 
 	cleanup := func() {
@@ -30,11 +31,11 @@ func setupTestRedis(t *testing.T) (*RedisClient, redismock.ClientMock, func()) {
 }
 
 func TestRedisClient_Users(t *testing.T) {
-	client, mock, cleanup := setupTestRedis(t)
+	teamID := "TEST123"
+	client, mock, cleanup := setupTestRedis(t, teamID)
 	defer cleanup()
 
 	ctx := context.Background()
-	teamID := "TEST123"
 
 	// Test data
 	users := []slack.User{
@@ -63,22 +64,30 @@ func TestRedisClient_Users(t *testing.T) {
 	mock.ExpectSet(expectedKey, expectedJSON, 0).SetVal("OK")
 
 	// Test SetUsers
-	err = client.SetUsers(ctx, teamID, users)
+	err = client.SetUsers(ctx, users)
 	require.NoError(t, err)
 
 	// Mock GetUsers
 	mock.ExpectGet(expectedKey).SetVal(string(expectedJSON))
 
 	// Test GetUsers
-	retrievedUsers, err := client.GetUsers(ctx, teamID)
+	retrievedUsers, err := client.GetUsers(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, users, retrievedUsers)
 
 	// Test GetUsers with non-existent team (Redis returns nil)
-	mock.ExpectGet("slack:NONEXISTENT:users").RedisNil()
-	emptyUsers, err := client.GetUsers(ctx, "NONEXISTENT")
+	// Note: We'll need a separate client for this test since each client is team-scoped
+	nonExistentClient, nonExistentMock, nonExistentCleanup := setupTestRedis(t, "NONEXISTENT")
+	defer nonExistentCleanup()
+
+	nonExistentMock.ExpectGet("slack:NONEXISTENT:users").RedisNil()
+	emptyUsers, err := nonExistentClient.GetUsers(ctx)
 	require.NoError(t, err)
 	assert.Nil(t, emptyUsers)
+
+	// Check non-existent mock expectations
+	err = nonExistentMock.ExpectationsWereMet()
+	require.NoError(t, err)
 
 	// Ensure all expectations were met
 	err = mock.ExpectationsWereMet()
@@ -86,11 +95,11 @@ func TestRedisClient_Users(t *testing.T) {
 }
 
 func TestRedisClient_Channels(t *testing.T) {
-	client, mock, cleanup := setupTestRedis(t)
+	teamID := "TEST123"
+	client, mock, cleanup := setupTestRedis(t, teamID)
 	defer cleanup()
 
 	ctx := context.Background()
-	teamID := "TEST123"
 
 	// Test data
 	channels := []Channel{
@@ -125,22 +134,29 @@ func TestRedisClient_Channels(t *testing.T) {
 	mock.ExpectSet(expectedKey, expectedJSON, 0).SetVal("OK")
 
 	// Test SetChannels
-	err = client.SetChannels(ctx, teamID, channels)
+	err = client.SetChannels(ctx, channels)
 	require.NoError(t, err)
 
 	// Mock GetChannels
 	mock.ExpectGet(expectedKey).SetVal(string(expectedJSON))
 
 	// Test GetChannels
-	retrievedChannels, err := client.GetChannels(ctx, teamID)
+	retrievedChannels, err := client.GetChannels(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, channels, retrievedChannels)
 
 	// Test GetChannels with non-existent team
-	mock.ExpectGet("slack:NONEXISTENT:channels").RedisNil()
-	emptyChannels, err := client.GetChannels(ctx, "NONEXISTENT")
+	nonExistentClient, nonExistentMock, nonExistentCleanup := setupTestRedis(t, "NONEXISTENT")
+	defer nonExistentCleanup()
+
+	nonExistentMock.ExpectGet("slack:NONEXISTENT:channels").RedisNil()
+	emptyChannels, err := nonExistentClient.GetChannels(ctx)
 	require.NoError(t, err)
 	assert.Nil(t, emptyChannels)
+
+	// Check non-existent mock expectations
+	err = nonExistentMock.ExpectationsWereMet()
+	require.NoError(t, err)
 
 	// Ensure all expectations were met
 	err = mock.ExpectationsWereMet()
@@ -148,12 +164,15 @@ func TestRedisClient_Channels(t *testing.T) {
 }
 
 func TestRedisClient_MultiTenant(t *testing.T) {
-	client, mock, cleanup := setupTestRedis(t)
-	defer cleanup()
-
 	ctx := context.Background()
 	teamID1 := "TEAM1"
 	teamID2 := "TEAM2"
+
+	// Create separate clients for each team
+	client1, mock1, cleanup1 := setupTestRedis(t, teamID1)
+	defer cleanup1()
+	client2, mock2, cleanup2 := setupTestRedis(t, teamID2)
+	defer cleanup2()
 
 	// Test data for team 1
 	users1 := []slack.User{
@@ -181,44 +200,47 @@ func TestRedisClient_MultiTenant(t *testing.T) {
 	channels2JSON, err := json.Marshal(channels2)
 	require.NoError(t, err)
 
-	// Mock SET operations for both teams
-	mock.ExpectSet("slack:TEAM1:users", users1JSON, 0).SetVal("OK")
-	mock.ExpectSet("slack:TEAM1:channels", channels1JSON, 0).SetVal("OK")
-	mock.ExpectSet("slack:TEAM2:users", users2JSON, 0).SetVal("OK")
-	mock.ExpectSet("slack:TEAM2:channels", channels2JSON, 0).SetVal("OK")
+	// Mock SET operations for team 1
+	mock1.ExpectSet("slack:TEAM1:users", users1JSON, 0).SetVal("OK")
+	mock1.ExpectSet("slack:TEAM1:channels", channels1JSON, 0).SetVal("OK")
 
-	// Set data for both teams
-	err = client.SetUsers(ctx, teamID1, users1)
+	// Mock SET operations for team 2
+	mock2.ExpectSet("slack:TEAM2:users", users2JSON, 0).SetVal("OK")
+	mock2.ExpectSet("slack:TEAM2:channels", channels2JSON, 0).SetVal("OK")
+
+	// Set data for team 1
+	err = client1.SetUsers(ctx, users1)
 	require.NoError(t, err)
-	err = client.SetChannels(ctx, teamID1, channels1)
+	err = client1.SetChannels(ctx, channels1)
 	require.NoError(t, err)
 
-	err = client.SetUsers(ctx, teamID2, users2)
+	// Set data for team 2
+	err = client2.SetUsers(ctx, users2)
 	require.NoError(t, err)
-	err = client.SetChannels(ctx, teamID2, channels2)
+	err = client2.SetChannels(ctx, channels2)
 	require.NoError(t, err)
 
 	// Mock GET operations for verification
-	mock.ExpectGet("slack:TEAM1:users").SetVal(string(users1JSON))
-	mock.ExpectGet("slack:TEAM1:channels").SetVal(string(channels1JSON))
-	mock.ExpectGet("slack:TEAM2:users").SetVal(string(users2JSON))
-	mock.ExpectGet("slack:TEAM2:channels").SetVal(string(channels2JSON))
+	mock1.ExpectGet("slack:TEAM1:users").SetVal(string(users1JSON))
+	mock1.ExpectGet("slack:TEAM1:channels").SetVal(string(channels1JSON))
+	mock2.ExpectGet("slack:TEAM2:users").SetVal(string(users2JSON))
+	mock2.ExpectGet("slack:TEAM2:channels").SetVal(string(channels2JSON))
 
 	// Verify team 1 data
-	retrievedUsers1, err := client.GetUsers(ctx, teamID1)
+	retrievedUsers1, err := client1.GetUsers(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, users1, retrievedUsers1)
 
-	retrievedChannels1, err := client.GetChannels(ctx, teamID1)
+	retrievedChannels1, err := client1.GetChannels(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, channels1, retrievedChannels1)
 
 	// Verify team 2 data
-	retrievedUsers2, err := client.GetUsers(ctx, teamID2)
+	retrievedUsers2, err := client2.GetUsers(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, users2, retrievedUsers2)
 
-	retrievedChannels2, err := client.GetChannels(ctx, teamID2)
+	retrievedChannels2, err := client2.GetChannels(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, channels2, retrievedChannels2)
 
@@ -226,7 +248,9 @@ func TestRedisClient_MultiTenant(t *testing.T) {
 	assert.NotEqual(t, retrievedUsers1, retrievedUsers2)
 	assert.NotEqual(t, retrievedChannels1, retrievedChannels2)
 
-	// Ensure all expectations were met
-	err = mock.ExpectationsWereMet()
+	// Ensure all expectations were met for both mocks
+	err = mock1.ExpectationsWereMet()
+	require.NoError(t, err)
+	err = mock2.ExpectationsWereMet()
 	require.NoError(t, err)
 }

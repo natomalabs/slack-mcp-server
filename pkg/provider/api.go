@@ -94,6 +94,8 @@ type ApiProvider struct {
 	channels      map[string]Channel
 	channelsInv   map[string]string
 	channelsReady bool
+
+	redisClient *RedisClient
 }
 
 func NewMCPSlackClient(authProvider auth.Provider, logger *zap.Logger) (*MCPSlackClient, error) {
@@ -310,11 +312,27 @@ func New(transport string, logger *zap.Logger) *ApiProvider {
 	return newWithXOXC(transport, authProvider, logger)
 }
 
+// getRedisClient returns a Redis client for the given team ID, creating it if necessary
+func (ap *ApiProvider) getRedisClient(teamID string) (*RedisClient, error) {
+	if teamID == "" {
+		return nil, nil
+	}
+
+	// Check if Redis is configured
+	if os.Getenv("REDIS_ADDR") == "" && os.Getenv("REDIS_PASSWORD") == "" && os.Getenv("REDIS_DB") == "" {
+		return nil, nil
+	}
+
+	// For now, create a new client each time. In the future, we could cache clients by teamID
+	return NewRedisClient(ap.logger, teamID)
+}
+
 func newWithXOXP(transport string, authProvider auth.ValueAuth, logger *zap.Logger) *ApiProvider {
 	var (
 		client *MCPSlackClient
 		err    error
 	)
+
 
 	if os.Getenv("SLACK_MCP_XOXP_TOKEN") == "demo" || (os.Getenv("SLACK_MCP_XOXC_TOKEN") == "demo" && os.Getenv("SLACK_MCP_XOXD_TOKEN") == "demo") {
 		logger.Info("Demo credentials are set, skip.")
@@ -332,11 +350,13 @@ func newWithXOXP(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 
 		rateLimiter: limiter.Tier2.Limiter(),
 
-		users:    make(map[string]slack.User),
-		usersInv: map[string]string{},
+		users:      make(map[string]slack.User),
+		usersInv:   map[string]string{},
 
-		channels:    make(map[string]Channel),
-		channelsInv: map[string]string{},
+		channels:      make(map[string]Channel),
+		channelsInv:   map[string]string{},
+
+		redisClient: nil,
 	}
 }
 
@@ -346,6 +366,7 @@ func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 		err    error
 	)
 
+
 	if os.Getenv("SLACK_MCP_XOXP_TOKEN") == "demo" || (os.Getenv("SLACK_MCP_XOXC_TOKEN") == "demo" && os.Getenv("SLACK_MCP_XOXD_TOKEN") == "demo") {
 		logger.Info("Demo credentials are set, skip.")
 	} else {
@@ -362,11 +383,13 @@ func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 
 		rateLimiter: limiter.Tier2.Limiter(),
 
-		users:    make(map[string]slack.User),
-		usersInv: map[string]string{},
+		users:      make(map[string]slack.User),
+		usersInv:   map[string]string{},
 
-		channels:    make(map[string]Channel),
-		channelsInv: map[string]string{},
+		channels:      make(map[string]Channel),
+		channelsInv:   map[string]string{},
+
+		redisClient: nil,
 	}
 }
 
@@ -375,6 +398,38 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		usersCounter = 0
 		optionLimit  = slack.GetUsersOptionLimit(1000)
 	)
+
+	// Get team ID for cache partitioning
+	authResp, err := ap.client.AuthTest()
+	if err != nil {
+		ap.logger.Error("Failed to get auth test for team ID", zap.Error(err))
+		return err
+	}
+	teamID := authResp.TeamID
+	if teamID == "" {
+		ap.logger.Warn("Team ID is empty, skipping Redis cache operations")
+	}
+
+	// Try to load from Redis cache first
+	redisClient, err := ap.getRedisClient(teamID)
+	if err != nil {
+		ap.logger.Error("Failed to create Redis client", zap.Error(err))
+	} else if redisClient != nil {
+		cachedUsers, err := redisClient.GetUsers(ctx)
+		if err != nil {
+			ap.logger.Warn("Failed to get users from Redis cache", zap.Error(err))
+		} else if cachedUsers != nil {
+			for _, u := range cachedUsers {
+				ap.users[u.ID] = u
+				ap.usersInv[u.Name] = u.ID
+			}
+			ap.logger.Info("Loaded users from Redis cache",
+				zap.String("team_id", teamID),
+				zap.Int("count", len(cachedUsers)))
+			ap.usersReady = true
+			return nil
+		}
+	}
 
 	users, err := ap.client.GetUsersContext(ctx,
 		optionLimit,
@@ -402,6 +457,21 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		usersCounter++
 	}
 
+	// Create user list for caching
+	var list []slack.User
+	for _, u := range ap.users {
+		list = append(list, u)
+	}
+
+	// Cache to Redis
+	if redisClient != nil {
+		if err := redisClient.SetUsers(ctx, list); err != nil {
+			ap.logger.Error("Failed to cache users to Redis",
+				zap.String("team_id", teamID),
+				zap.Error(err))
+		}
+	}
+
 	ap.logger.Info("Loaded users from API",
 		zap.Int("count", usersCounter))
 
@@ -411,7 +481,48 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 }
 
 func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
+	// Get team ID for cache partitioning
+	authResp, err := ap.client.AuthTest()
+	if err != nil {
+		ap.logger.Error("Failed to get auth test for team ID", zap.Error(err))
+		return err
+	}
+	teamID := authResp.TeamID
+	if teamID == "" {
+		ap.logger.Warn("Team ID is empty, skipping Redis cache operations")
+	}
+
+	// Try to load from Redis cache first
+	redisClient, err := ap.getRedisClient(teamID)
+	if err != nil {
+		ap.logger.Error("Failed to create Redis client", zap.Error(err))
+	} else if redisClient != nil {
+		cachedChannels, err := redisClient.GetChannels(ctx)
+		if err != nil {
+			ap.logger.Warn("Failed to get channels from Redis cache", zap.Error(err))
+		} else if cachedChannels != nil {
+			for _, c := range cachedChannels {
+				ap.channels[c.ID] = c
+				ap.channelsInv[c.Name] = c.ID
+			}
+			ap.logger.Info("Loaded channels from Redis cache",
+				zap.String("team_id", teamID),
+				zap.Int("count", len(cachedChannels)))
+			ap.channelsReady = true
+			return nil
+		}
+	}
+
 	channels := ap.GetChannels(ctx, AllChanTypes)
+
+	// Cache to Redis
+	if redisClient != nil {
+		if err := redisClient.SetChannels(ctx, channels); err != nil {
+			ap.logger.Error("Failed to cache channels to Redis",
+				zap.String("team_id", teamID),
+				zap.Error(err))
+		}
+	}
 
 	ap.logger.Info("Loaded channels from API",
 		zap.Int("count", len(channels)))

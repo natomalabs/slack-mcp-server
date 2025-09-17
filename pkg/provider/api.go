@@ -15,8 +15,8 @@ import (
 	"golang.org/x/time/rate"
 )
 
-const usersNotReadyMsg = "users cache is not ready yet, sync process is still running... please wait"
-const channelsNotReadyMsg = "channels cache is not ready yet, sync process is still running... please wait"
+const usersNotReadyMsg = "users data is not ready yet, loading process is still running... please wait"
+const channelsNotReadyMsg = "channels data is not ready yet, loading process is still running... please wait"
 const defaultUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 
 var AllChanTypes = []string{"mpim", "im", "public_channel", "private_channel"}
@@ -394,7 +394,6 @@ func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 
 func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 	var (
-		list         []slack.User
 		usersCounter = 0
 		optionLimit  = slack.GetUsersOptionLimit(1000)
 	)
@@ -431,8 +430,6 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 	if err != nil {
 		ap.logger.Error("Failed to fetch users", zap.Error(err))
 		return err
-	} else {
-		list = append(list, users...)
 	}
 
 	for _, user := range users {
@@ -441,18 +438,22 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		usersCounter++
 	}
 
-	users, err = ap.GetSlackConnect(ctx)
+	slackConnectUsers, err := ap.GetSlackConnect(ctx)
 	if err != nil {
 		ap.logger.Error("Failed to fetch users from Slack Connect", zap.Error(err))
 		return err
-	} else {
-		list = append(list, users...)
 	}
 
-	for _, user := range users {
+	for _, user := range slackConnectUsers {
 		ap.users[user.ID] = user
 		ap.usersInv[user.Name] = user.ID
 		usersCounter++
+	}
+
+	// Create user list for caching
+	var list []slack.User
+	for _, u := range ap.users {
+		list = append(list, u)
 	}
 
 	// Cache to Redis
@@ -463,6 +464,9 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 				zap.Error(err))
 		}
 	}
+
+	ap.logger.Info("Loaded users from API",
+		zap.Int("count", usersCounter))
 
 	ap.usersReady = true
 
@@ -506,6 +510,9 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 				zap.Error(err))
 		}
 	}
+
+	ap.logger.Info("Loaded channels from API",
+		zap.Int("count", len(channels)))
 
 	ap.channelsReady = true
 

@@ -514,13 +514,13 @@ func (ch *ConversationsHandler) parseParamsToolConversations(request mcp.CallToo
 					zap.Error(err),
 				)
 			}
-			return nil, fmt.Errorf("channel %q not found in empty cache", channel)
+			return nil, fmt.Errorf("channel %q not found, data not yet loaded", channel)
 		}
 		channelsMaps := ch.apiProvider.ProvideChannelsMaps()
 		chn, ok := channelsMaps.ChannelsInv[channel]
 		if !ok {
-			ch.logger.Error("Channel not found in synced cache", zap.String("channel", channel))
-			return nil, fmt.Errorf("channel %q not found in synced cache. Try to remove old cache file and restart MCP Server", channel)
+			ch.logger.Error("Channel not found in loaded data", zap.String("channel", channel))
+			return nil, fmt.Errorf("channel %q not found in loaded data. Try restarting MCP Server", channel)
 		}
 		channel = channelsMaps.Channels[chn].ID
 	}

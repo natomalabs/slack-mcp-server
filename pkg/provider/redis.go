@@ -17,9 +17,10 @@ import (
 type RedisClient struct {
 	client *redis.Client
 	logger *zap.Logger
+	teamID string
 }
 
-func NewRedisClient(logger *zap.Logger) (*RedisClient, error) {
+func NewRedisClient(logger *zap.Logger, teamID string) (*RedisClient, error) {
 	addr := os.Getenv("REDIS_ADDR")
 	if addr == "" {
 		addr = "localhost:6379"
@@ -58,29 +59,35 @@ func NewRedisClient(logger *zap.Logger) (*RedisClient, error) {
 	return &RedisClient{
 		client: rdb,
 		logger: logger,
+		teamID: teamID,
 	}, nil
 }
 
-func (r *RedisClient) SetUsers(ctx context.Context, teamID string, users []slack.User) error {
+// getSlackKey generates a standardized Redis key with slack: prefix
+func (r *RedisClient) getSlackKey(resource string) string {
+	return fmt.Sprintf("slack:%s:%s", r.teamID, resource)
+}
+
+func (r *RedisClient) SetUsers(ctx context.Context, users []slack.User) error {
 	data, err := json.Marshal(users)
 	if err != nil {
 		return fmt.Errorf("failed to marshal users: %v", err)
 	}
 
-	key := fmt.Sprintf("slack:%s:users", teamID)
+	key := r.getSlackKey("users")
 	err = r.client.Set(ctx, key, data, 0).Err()
 	if err != nil {
 		return fmt.Errorf("failed to set users in Redis: %v", err)
 	}
 
 	r.logger.Info("Cached users to Redis",
-		zap.String("team_id", teamID),
+		zap.String("team_id", r.teamID),
 		zap.Int("count", len(users)))
 	return nil
 }
 
-func (r *RedisClient) GetUsers(ctx context.Context, teamID string) ([]slack.User, error) {
-	key := fmt.Sprintf("slack:%s:users", teamID)
+func (r *RedisClient) GetUsers(ctx context.Context) ([]slack.User, error) {
+	key := r.getSlackKey("users")
 	data, err := r.client.Get(ctx, key).Result()
 	if err != nil {
 		if err == redis.Nil {
@@ -96,31 +103,31 @@ func (r *RedisClient) GetUsers(ctx context.Context, teamID string) ([]slack.User
 	}
 
 	r.logger.Info("Loaded users from Redis",
-		zap.String("team_id", teamID),
+		zap.String("team_id", r.teamID),
 		zap.Int("count", len(users)))
 	return users, nil
 }
 
-func (r *RedisClient) SetChannels(ctx context.Context, teamID string, channels []Channel) error {
+func (r *RedisClient) SetChannels(ctx context.Context, channels []Channel) error {
 	data, err := json.Marshal(channels)
 	if err != nil {
 		return fmt.Errorf("failed to marshal channels: %v", err)
 	}
 
-	key := fmt.Sprintf("slack:%s:channels", teamID)
+	key := r.getSlackKey("channels")
 	err = r.client.Set(ctx, key, data, 0).Err()
 	if err != nil {
 		return fmt.Errorf("failed to set channels in Redis: %v", err)
 	}
 
 	r.logger.Info("Cached channels to Redis",
-		zap.String("team_id", teamID),
+		zap.String("team_id", r.teamID),
 		zap.Int("count", len(channels)))
 	return nil
 }
 
-func (r *RedisClient) GetChannels(ctx context.Context, teamID string) ([]Channel, error) {
-	key := fmt.Sprintf("slack:%s:channels", teamID)
+func (r *RedisClient) GetChannels(ctx context.Context) ([]Channel, error) {
+	key := r.getSlackKey("channels")
 	data, err := r.client.Get(ctx, key).Result()
 	if err != nil {
 		if err == redis.Nil {
@@ -136,7 +143,7 @@ func (r *RedisClient) GetChannels(ctx context.Context, teamID string) ([]Channel
 	}
 
 	r.logger.Info("Loaded channels from Redis",
-		zap.String("team_id", teamID),
+		zap.String("team_id", r.teamID),
 		zap.Int("count", len(channels)))
 	return channels, nil
 }

@@ -312,19 +312,27 @@ func New(transport string, logger *zap.Logger) *ApiProvider {
 	return newWithXOXC(transport, authProvider, logger)
 }
 
+// getRedisClient returns a Redis client for the given team ID, creating it if necessary
+func (ap *ApiProvider) getRedisClient(teamID string) (*RedisClient, error) {
+	if teamID == "" {
+		return nil, nil
+	}
+
+	// Check if Redis is configured
+	if os.Getenv("REDIS_ADDR") == "" && os.Getenv("REDIS_PASSWORD") == "" && os.Getenv("REDIS_DB") == "" {
+		return nil, nil
+	}
+
+	// For now, create a new client each time. In the future, we could cache clients by teamID
+	return NewRedisClient(ap.logger, teamID)
+}
+
 func newWithXOXP(transport string, authProvider auth.ValueAuth, logger *zap.Logger) *ApiProvider {
 	var (
 		client *MCPSlackClient
 		err    error
 	)
 
-	var redisClient *RedisClient
-	if os.Getenv("REDIS_ADDR") != "" || os.Getenv("REDIS_PASSWORD") != "" || os.Getenv("REDIS_DB") != "" {
-		redisClient, err = NewRedisClient(logger)
-		if err != nil {
-			logger.Fatal("Failed to create Redis client", zap.Error(err))
-		}
-	}
 
 	if os.Getenv("SLACK_MCP_XOXP_TOKEN") == "demo" || (os.Getenv("SLACK_MCP_XOXC_TOKEN") == "demo" && os.Getenv("SLACK_MCP_XOXD_TOKEN") == "demo") {
 		logger.Info("Demo credentials are set, skip.")
@@ -348,7 +356,7 @@ func newWithXOXP(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 		channels:      make(map[string]Channel),
 		channelsInv:   map[string]string{},
 
-		redisClient: redisClient,
+		redisClient: nil,
 	}
 }
 
@@ -358,13 +366,6 @@ func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 		err    error
 	)
 
-	var redisClient *RedisClient
-	if os.Getenv("REDIS_ADDR") != "" || os.Getenv("REDIS_PASSWORD") != "" || os.Getenv("REDIS_DB") != "" {
-		redisClient, err = NewRedisClient(logger)
-		if err != nil {
-			logger.Fatal("Failed to create Redis client", zap.Error(err))
-		}
-	}
 
 	if os.Getenv("SLACK_MCP_XOXP_TOKEN") == "demo" || (os.Getenv("SLACK_MCP_XOXC_TOKEN") == "demo" && os.Getenv("SLACK_MCP_XOXD_TOKEN") == "demo") {
 		logger.Info("Demo credentials are set, skip.")
@@ -388,7 +389,7 @@ func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 		channels:      make(map[string]Channel),
 		channelsInv:   map[string]string{},
 
-		redisClient: redisClient,
+		redisClient: nil,
 	}
 }
 
@@ -405,10 +406,16 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		return err
 	}
 	teamID := authResp.TeamID
+	if teamID == "" {
+		ap.logger.Warn("Team ID is empty, skipping Redis cache operations")
+	}
 
 	// Try to load from Redis cache first
-	if ap.redisClient != nil {
-		cachedUsers, err := ap.redisClient.GetUsers(ctx, teamID)
+	redisClient, err := ap.getRedisClient(teamID)
+	if err != nil {
+		ap.logger.Error("Failed to create Redis client", zap.Error(err))
+	} else if redisClient != nil {
+		cachedUsers, err := redisClient.GetUsers(ctx)
 		if err != nil {
 			ap.logger.Warn("Failed to get users from Redis cache", zap.Error(err))
 		} else if cachedUsers != nil {
@@ -457,8 +464,8 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 	}
 
 	// Cache to Redis
-	if ap.redisClient != nil {
-		if err := ap.redisClient.SetUsers(ctx, teamID, list); err != nil {
+	if redisClient != nil {
+		if err := redisClient.SetUsers(ctx, list); err != nil {
 			ap.logger.Error("Failed to cache users to Redis",
 				zap.String("team_id", teamID),
 				zap.Error(err))
@@ -481,10 +488,16 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 		return err
 	}
 	teamID := authResp.TeamID
+	if teamID == "" {
+		ap.logger.Warn("Team ID is empty, skipping Redis cache operations")
+	}
 
 	// Try to load from Redis cache first
-	if ap.redisClient != nil {
-		cachedChannels, err := ap.redisClient.GetChannels(ctx, teamID)
+	redisClient, err := ap.getRedisClient(teamID)
+	if err != nil {
+		ap.logger.Error("Failed to create Redis client", zap.Error(err))
+	} else if redisClient != nil {
+		cachedChannels, err := redisClient.GetChannels(ctx)
 		if err != nil {
 			ap.logger.Warn("Failed to get channels from Redis cache", zap.Error(err))
 		} else if cachedChannels != nil {
@@ -503,8 +516,8 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 	channels := ap.GetChannels(ctx, AllChanTypes)
 
 	// Cache to Redis
-	if ap.redisClient != nil {
-		if err := ap.redisClient.SetChannels(ctx, teamID, channels); err != nil {
+	if redisClient != nil {
+		if err := redisClient.SetChannels(ctx, channels); err != nil {
 			ap.logger.Error("Failed to cache channels to Redis",
 				zap.String("team_id", teamID),
 				zap.Error(err))

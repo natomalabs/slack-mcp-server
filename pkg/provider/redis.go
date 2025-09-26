@@ -13,14 +13,19 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	// CacheTTL is the default TTL for cached data (6 hours)
+	CacheTTL = 6 * time.Hour
+)
 
 type RedisClient struct {
 	client *redis.Client
 	logger *zap.Logger
 	teamID string
+	userID string
 }
 
-func NewRedisClient(logger *zap.Logger, teamID string) (*RedisClient, error) {
+func NewRedisClient(logger *zap.Logger, teamID string, userID string) (*RedisClient, error) {
 	addr := os.Getenv("REDIS_ADDR")
 	if addr == "" {
 		addr = "localhost:6379"
@@ -60,12 +65,13 @@ func NewRedisClient(logger *zap.Logger, teamID string) (*RedisClient, error) {
 		client: rdb,
 		logger: logger,
 		teamID: teamID,
+		userID: userID,
 	}, nil
 }
 
-// getSlackKey generates a standardized Redis key with slack: prefix
+// getSlackKey generates a standardized Redis key with slack: prefix using TEAM_ID/USER_ID namespace
 func (r *RedisClient) getSlackKey(resource string) string {
-	return fmt.Sprintf("slack:%s:%s", r.teamID, resource)
+	return fmt.Sprintf("slack:%s/%s:%s", r.teamID, r.userID, resource)
 }
 
 func (r *RedisClient) SetUsers(ctx context.Context, users []slack.User) error {
@@ -75,13 +81,14 @@ func (r *RedisClient) SetUsers(ctx context.Context, users []slack.User) error {
 	}
 
 	key := r.getSlackKey("users")
-	err = r.client.Set(ctx, key, data, 0).Err()
+	err = r.client.Set(ctx, key, data, CacheTTL).Err()
 	if err != nil {
 		return fmt.Errorf("failed to set users in Redis: %v", err)
 	}
 
 	r.logger.Info("Cached users to Redis",
 		zap.String("team_id", r.teamID),
+		zap.String("user_id", r.userID),
 		zap.Int("count", len(users)))
 	return nil
 }
@@ -104,6 +111,7 @@ func (r *RedisClient) GetUsers(ctx context.Context) ([]slack.User, error) {
 
 	r.logger.Info("Loaded users from Redis",
 		zap.String("team_id", r.teamID),
+		zap.String("user_id", r.userID),
 		zap.Int("count", len(users)))
 	return users, nil
 }
@@ -115,13 +123,14 @@ func (r *RedisClient) SetChannels(ctx context.Context, channels []Channel) error
 	}
 
 	key := r.getSlackKey("channels")
-	err = r.client.Set(ctx, key, data, 0).Err()
+	err = r.client.Set(ctx, key, data, CacheTTL).Err()
 	if err != nil {
 		return fmt.Errorf("failed to set channels in Redis: %v", err)
 	}
 
 	r.logger.Info("Cached channels to Redis",
 		zap.String("team_id", r.teamID),
+		zap.String("user_id", r.userID),
 		zap.Int("count", len(channels)))
 	return nil
 }
@@ -144,6 +153,7 @@ func (r *RedisClient) GetChannels(ctx context.Context) ([]Channel, error) {
 
 	r.logger.Info("Loaded channels from Redis",
 		zap.String("team_id", r.teamID),
+		zap.String("user_id", r.userID),
 		zap.Int("count", len(channels)))
 	return channels, nil
 }

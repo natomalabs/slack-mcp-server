@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/korotovsky/slack-mcp-server/pkg/limiter"
 	"github.com/korotovsky/slack-mcp-server/pkg/provider/edge"
@@ -86,6 +87,9 @@ type ApiProvider struct {
 	logger    *zap.Logger
 
 	rateLimiter *rate.Limiter
+
+	// Mutex to protect concurrent access to users and channels data
+	mu sync.RWMutex
 
 	users      map[string]slack.User
 	usersInv   map[string]string
@@ -411,24 +415,36 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 			zap.String("user_id", userID))
 	}
 
+	// Create Redis client once and ensure it's closed
+	var redisClient *RedisClient
+	if teamID != "" && userID != "" {
+		redisClient, err = ap.getRedisClient(teamID, userID)
+		if err != nil {
+			ap.logger.Error("Failed to create Redis client", zap.Error(err))
+		}
+		if redisClient != nil {
+			defer redisClient.Close() // Ensure Redis client is closed to prevent connection leaks
+		}
+	}
+
 	// Try to load from Redis cache first
-	redisClient, err := ap.getRedisClient(teamID, userID)
-	if err != nil {
-		ap.logger.Error("Failed to create Redis client", zap.Error(err))
-	} else if redisClient != nil {
+	if redisClient != nil {
 		cachedUsers, err := redisClient.GetUsers(ctx)
 		if err != nil {
 			ap.logger.Warn("Failed to get users from Redis cache", zap.Error(err))
 		} else if cachedUsers != nil {
+			ap.mu.Lock()
 			for _, u := range cachedUsers {
 				ap.users[u.ID] = u
 				ap.usersInv[u.Name] = u.ID
 			}
+			ap.usersReady = true
+			ap.mu.Unlock()
+
 			ap.logger.Info("Loaded users from Redis cache",
 				zap.String("team_id", teamID),
 				zap.String("user_id", userID),
 				zap.Int("count", len(cachedUsers)))
-			ap.usersReady = true
 			return nil
 		}
 	}
@@ -441,27 +457,31 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		return err
 	}
 
-	for _, user := range users {
-		ap.users[user.ID] = user
-		ap.usersInv[user.Name] = user.ID
-		usersCounter++
-	}
-
 	slackConnectUsers, err := ap.GetSlackConnect(ctx)
 	if err != nil {
 		ap.logger.Error("Failed to fetch users from Slack Connect", zap.Error(err))
 		return err
 	}
 
+	// Prepare all user data before acquiring lock
+	allUsers := make(map[string]slack.User)
+	allUsersInv := make(map[string]string)
+
+	for _, user := range users {
+		allUsers[user.ID] = user
+		allUsersInv[user.Name] = user.ID
+		usersCounter++
+	}
+
 	for _, user := range slackConnectUsers {
-		ap.users[user.ID] = user
-		ap.usersInv[user.Name] = user.ID
+		allUsers[user.ID] = user
+		allUsersInv[user.Name] = user.ID
 		usersCounter++
 	}
 
 	// Create user list for caching
 	var list []slack.User
-	for _, u := range ap.users {
+	for _, u := range allUsers {
 		list = append(list, u)
 	}
 
@@ -478,7 +498,12 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 	ap.logger.Info("Loaded users from API",
 		zap.Int("count", usersCounter))
 
+	// Atomically update the shared state
+	ap.mu.Lock()
+	ap.users = allUsers
+	ap.usersInv = allUsersInv
 	ap.usersReady = true
+	ap.mu.Unlock()
 
 	return nil
 }
@@ -498,29 +523,50 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 			zap.String("user_id", userID))
 	}
 
+	// Create Redis client once and ensure it's closed
+	var redisClient *RedisClient
+	if teamID != "" && userID != "" {
+		redisClient, err = ap.getRedisClient(teamID, userID)
+		if err != nil {
+			ap.logger.Error("Failed to create Redis client", zap.Error(err))
+		}
+		if redisClient != nil {
+			defer redisClient.Close() // Ensure Redis client is closed to prevent connection leaks
+		}
+	}
+
 	// Try to load from Redis cache first
-	redisClient, err := ap.getRedisClient(teamID, userID)
-	if err != nil {
-		ap.logger.Error("Failed to create Redis client", zap.Error(err))
-	} else if redisClient != nil {
+	if redisClient != nil {
 		cachedChannels, err := redisClient.GetChannels(ctx)
 		if err != nil {
 			ap.logger.Warn("Failed to get channels from Redis cache", zap.Error(err))
 		} else if cachedChannels != nil {
+			ap.mu.Lock()
 			for _, c := range cachedChannels {
 				ap.channels[c.ID] = c
 				ap.channelsInv[c.Name] = c.ID
 			}
+			ap.channelsReady = true
+			ap.mu.Unlock()
+
 			ap.logger.Info("Loaded channels from Redis cache",
 				zap.String("team_id", teamID),
 				zap.String("user_id", userID),
 				zap.Int("count", len(cachedChannels)))
-			ap.channelsReady = true
 			return nil
 		}
 	}
 
 	channels := ap.GetChannels(ctx, AllChanTypes)
+
+	// Prepare channel data before acquiring lock
+	allChannels := make(map[string]Channel)
+	allChannelsInv := make(map[string]string)
+
+	for _, c := range channels {
+		allChannels[c.ID] = c
+		allChannelsInv[c.Name] = c.ID
+	}
 
 	// Cache to Redis
 	if redisClient != nil {
@@ -535,7 +581,12 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 	ap.logger.Info("Loaded channels from API",
 		zap.Int("count", len(channels)))
 
+	// Atomically update the shared state
+	ap.mu.Lock()
+	ap.channels = allChannels
+	ap.channelsInv = allChannelsInv
 	ap.channelsReady = true
+	ap.mu.Unlock()
 
 	return nil
 }
@@ -659,6 +710,9 @@ func (ap *ApiProvider) GetChannels(ctx context.Context, channelTypes []string) [
 }
 
 func (ap *ApiProvider) ProvideUsersMap() *UsersCache {
+	ap.mu.RLock()
+	defer ap.mu.RUnlock()
+
 	return &UsersCache{
 		Users:    ap.users,
 		UsersInv: ap.usersInv,
@@ -666,6 +720,9 @@ func (ap *ApiProvider) ProvideUsersMap() *UsersCache {
 }
 
 func (ap *ApiProvider) ProvideChannelsMaps() *ChannelsCache {
+	ap.mu.RLock()
+	defer ap.mu.RUnlock()
+
 	return &ChannelsCache{
 		Channels:    ap.channels,
 		ChannelsInv: ap.channelsInv,
@@ -673,6 +730,9 @@ func (ap *ApiProvider) ProvideChannelsMaps() *ChannelsCache {
 }
 
 func (ap *ApiProvider) IsReady() (bool, error) {
+	ap.mu.RLock()
+	defer ap.mu.RUnlock()
+
 	if !ap.usersReady {
 		return false, ErrUsersNotReady
 	}

@@ -19,13 +19,13 @@ const (
 )
 
 type RedisClient struct {
-	client *redis.Client
-	logger *zap.Logger
-	teamID string
-	userID string
+	client     *redis.Client
+	logger     *zap.Logger
+	instanceID string
+	userID     string
 }
 
-func NewRedisClient(logger *zap.Logger, teamID string, userID string) (*RedisClient, error) {
+func NewRedisClient(logger *zap.Logger, instanceID string, userID string) (*RedisClient, error) {
 	addr := os.Getenv("REDIS_ADDR")
 	if addr == "" {
 		addr = "localhost:6379"
@@ -62,16 +62,17 @@ func NewRedisClient(logger *zap.Logger, teamID string, userID string) (*RedisCli
 		zap.Int("db", db))
 
 	return &RedisClient{
-		client: rdb,
-		logger: logger,
-		teamID: teamID,
-		userID: userID,
+		client:     rdb,
+		logger:     logger,
+		instanceID: instanceID,
+		userID:     userID,
 	}, nil
 }
 
-// getSlackKey generates a standardized Redis key with slack: prefix using TEAM_ID/USER_ID namespace
+// getSlackKey generates a standardized Redis key with slack: prefix using INSTANCE_ID/USER_ID namespace
 func (r *RedisClient) getSlackKey(resource string) string {
-	return fmt.Sprintf("slack:%s/%s:%s", r.teamID, r.userID, resource)
+	// instanceID represents the unique workspace identifier (enterpriseID for enterprise workspaces, teamID for non-enterprise)
+	return fmt.Sprintf("slack:%s/%s:%s", r.instanceID, r.userID, resource)
 }
 
 func (r *RedisClient) SetUsers(ctx context.Context, users []slack.User) error {
@@ -87,7 +88,7 @@ func (r *RedisClient) SetUsers(ctx context.Context, users []slack.User) error {
 	}
 
 	r.logger.Info("Cached users to Redis",
-		zap.String("team_id", r.teamID),
+		zap.String("instance_id", r.instanceID),
 		zap.String("user_id", r.userID),
 		zap.Int("count", len(users)))
 	return nil
@@ -110,7 +111,7 @@ func (r *RedisClient) GetUsers(ctx context.Context) ([]slack.User, error) {
 	}
 
 	r.logger.Info("Loaded users from Redis",
-		zap.String("team_id", r.teamID),
+		zap.String("instance_id", r.instanceID),
 		zap.String("user_id", r.userID),
 		zap.Int("count", len(users)))
 	return users, nil
@@ -129,7 +130,7 @@ func (r *RedisClient) SetChannels(ctx context.Context, channels []Channel) error
 	}
 
 	r.logger.Info("Cached channels to Redis",
-		zap.String("team_id", r.teamID),
+		zap.String("instance_id", r.instanceID),
 		zap.String("user_id", r.userID),
 		zap.Int("count", len(channels)))
 	return nil
@@ -152,7 +153,7 @@ func (r *RedisClient) GetChannels(ctx context.Context) ([]Channel, error) {
 	}
 
 	r.logger.Info("Loaded channels from Redis",
-		zap.String("team_id", r.teamID),
+		zap.String("instance_id", r.instanceID),
 		zap.String("user_id", r.userID),
 		zap.Int("count", len(channels)))
 	return channels, nil

@@ -76,7 +76,7 @@ func main() {
 		)
 
 		if ready, _ := p.IsReady(); !ready {
-			logger.Info("Slack MCP Server is still warming up caches",
+			logger.Info("Slack MCP Server is still loading data",
 				zap.String("context", "console"),
 			)
 		}
@@ -128,7 +128,7 @@ func main() {
 
 func newUsersWatcher(p *provider.ApiProvider, once *sync.Once, logger *zap.Logger) func() {
 	return func() {
-		logger.Info("Caching users collection...",
+		logger.Info("Loading users collection...",
 			zap.String("context", "console"),
 		)
 
@@ -160,7 +160,7 @@ func newUsersWatcher(p *provider.ApiProvider, once *sync.Once, logger *zap.Logge
 
 func newChannelsWatcher(p *provider.ApiProvider, once *sync.Once, logger *zap.Logger) func() {
 	return func() {
-		logger.Info("Caching channels collection...",
+		logger.Info("Loading channels collection...",
 			zap.String("context", "console"),
 		)
 

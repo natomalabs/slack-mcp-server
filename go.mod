@@ -49,6 +49,7 @@ require (
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/fatih/color v1.18.0 // indirect
 	github.com/go-jose/go-jose/v3 v3.0.4 // indirect
+	github.com/go-redis/redismock/v9 v9.2.0 // indirect
 	github.com/go-rod/rod v0.116.2 // indirect
 	github.com/go-stack/stack v1.8.1 // indirect
 	github.com/google/go-cmp v0.6.0 // indirect

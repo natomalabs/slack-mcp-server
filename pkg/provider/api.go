@@ -2,11 +2,10 @@ package provider
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io/ioutil"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/korotovsky/slack-mcp-server/pkg/limiter"
 	"github.com/korotovsky/slack-mcp-server/pkg/provider/edge"
@@ -17,8 +16,8 @@ import (
 	"golang.org/x/time/rate"
 )
 
-const usersNotReadyMsg = "users cache is not ready yet, sync process is still running... please wait"
-const channelsNotReadyMsg = "channels cache is not ready yet, sync process is still running... please wait"
+const usersNotReadyMsg = "users data is not ready yet, loading process is still running... please wait"
+const channelsNotReadyMsg = "channels data is not ready yet, loading process is still running... please wait"
 const defaultUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 
 var AllChanTypes = []string{"mpim", "im", "public_channel", "private_channel"}
@@ -58,12 +57,12 @@ type SlackAPI interface {
 	PostMessageContext(ctx context.Context, channel string, options ...slack.MsgOption) (string, string, error)
 	MarkConversationContext(ctx context.Context, channel, ts string) error
 
-	// Used to get messages
+	// Useed to get messages
 	GetConversationHistoryContext(ctx context.Context, params *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error)
 	GetConversationRepliesContext(ctx context.Context, params *slack.GetConversationRepliesParameters) (msgs []slack.Message, hasMore bool, nextCursor string, err error)
 	SearchContext(ctx context.Context, query string, params slack.SearchParameters) (*slack.SearchMessages, *slack.SearchFiles, error)
 
-	// Used to get channels list from both Slack and Enterprise Grid versions
+	// Useed to get channels list from both Slack and Enterprise Grid versions
 	GetConversationsContext(ctx context.Context, params *slack.GetConversationsParameters) ([]slack.Channel, string, error)
 
 	// Edge API methods
@@ -89,14 +88,15 @@ type ApiProvider struct {
 
 	rateLimiter *rate.Limiter
 
+	// Mutex to protect concurrent access to users and channels data
+	mu sync.RWMutex
+
 	users      map[string]slack.User
 	usersInv   map[string]string
-	usersCache string
 	usersReady bool
 
 	channels      map[string]Channel
 	channelsInv   map[string]string
-	channelsCache string
 	channelsReady bool
 
 	redisClient *RedisClient
@@ -283,21 +283,6 @@ func (c *MCPSlackClient) Raw() struct {
 	}
 }
 
-// getRedisClient returns a Redis client for the given instance ID and user ID, creating it if necessary
-func (ap *ApiProvider) getRedisClient(instanceID string, userID string) (*RedisClient, error) {
-	if instanceID == "" || userID == "" {
-		return nil, nil
-	}
-
-	// Check if Redis is configured
-	if os.Getenv("REDIS_ADDR") == "" && os.Getenv("REDIS_PASSWORD") == "" && os.Getenv("REDIS_DB") == "" {
-		return nil, nil
-	}
-
-	// For now, create a new client each time. In the future, we could cache clients by instanceID/userID
-	return NewRedisClient(ap.logger, instanceID, userID)
-}
-
 func New(transport string, logger *zap.Logger) *ApiProvider {
 	var (
 		authProvider auth.ValueAuth
@@ -331,22 +316,26 @@ func New(transport string, logger *zap.Logger) *ApiProvider {
 	return newWithXOXC(transport, authProvider, logger)
 }
 
+// getRedisClient returns a Redis client for the given instance ID and user ID, creating it if necessary
+func (ap *ApiProvider) getRedisClient(instanceID string, userID string) (*RedisClient, error) {
+	if instanceID == "" || userID == "" {
+		return nil, nil
+	}
+
+	// Check if Redis is configured
+	if os.Getenv("REDIS_ADDR") == "" && os.Getenv("REDIS_PASSWORD") == "" && os.Getenv("REDIS_DB") == "" {
+		return nil, nil
+	}
+
+	// For now, create a new client each time. In the future, we could cache clients by instanceID/userID
+	return NewRedisClient(ap.logger, instanceID, userID)
+}
+
 func newWithXOXP(transport string, authProvider auth.ValueAuth, logger *zap.Logger) *ApiProvider {
 	var (
 		client *MCPSlackClient
 		err    error
 	)
-
-	usersCache := os.Getenv("SLACK_MCP_USERS_CACHE")
-	if usersCache == "" {
-		usersCache = ".users_cache.json"
-	}
-
-	channelsCache := os.Getenv("SLACK_MCP_CHANNELS_CACHE")
-	if channelsCache == "" {
-		channelsCache = ".channels_cache.json"
-	}
-
 	if os.Getenv("SLACK_MCP_XOXP_TOKEN") == "demo" || (os.Getenv("SLACK_MCP_XOXC_TOKEN") == "demo" && os.Getenv("SLACK_MCP_XOXD_TOKEN") == "demo") {
 		logger.Info("Demo credentials are set, skip.")
 	} else {
@@ -363,13 +352,13 @@ func newWithXOXP(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 
 		rateLimiter: limiter.Tier2.Limiter(),
 
-		users:      make(map[string]slack.User),
-		usersInv:   map[string]string{},
-		usersCache: usersCache,
+		users:    make(map[string]slack.User),
+		usersInv: map[string]string{},
 
-		channels:      make(map[string]Channel),
-		channelsInv:   map[string]string{},
-		channelsCache: channelsCache,
+		channels:    make(map[string]Channel),
+		channelsInv: map[string]string{},
+
+		redisClient: nil,
 	}
 }
 
@@ -378,17 +367,6 @@ func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 		client *MCPSlackClient
 		err    error
 	)
-
-	usersCache := os.Getenv("SLACK_MCP_USERS_CACHE")
-	if usersCache == "" {
-		usersCache = ".users_cache.json"
-	}
-
-	channelsCache := os.Getenv("SLACK_MCP_CHANNELS_CACHE")
-	if channelsCache == "" {
-		channelsCache = ".channels_cache_v2.json"
-	}
-
 	if os.Getenv("SLACK_MCP_XOXP_TOKEN") == "demo" || (os.Getenv("SLACK_MCP_XOXC_TOKEN") == "demo" && os.Getenv("SLACK_MCP_XOXD_TOKEN") == "demo") {
 		logger.Info("Demo credentials are set, skip.")
 	} else {
@@ -405,19 +383,18 @@ func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 
 		rateLimiter: limiter.Tier2.Limiter(),
 
-		users:      make(map[string]slack.User),
-		usersInv:   map[string]string{},
-		usersCache: usersCache,
+		users:    make(map[string]slack.User),
+		usersInv: map[string]string{},
 
-		channels:      make(map[string]Channel),
-		channelsInv:   map[string]string{},
-		channelsCache: channelsCache,
+		channels:    make(map[string]Channel),
+		channelsInv: map[string]string{},
+
+		redisClient: nil,
 	}
 }
 
 func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 	var (
-		list         []slack.User
 		usersCounter = 0
 		optionLimit  = slack.GetUsersOptionLimit(1000)
 	)
@@ -438,6 +415,14 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		instanceID = teamID
 	}
 
+	if instanceID == "" || userID == "" {
+		ap.logger.Warn("Instance ID or User ID is empty, skipping Redis cache operations",
+			zap.String("instance_id", instanceID),
+			zap.String("user_id", userID),
+			zap.String("team_id", teamID),
+			zap.String("enterprise_id", enterpriseID))
+	}
+
 	// Create Redis client once and ensure it's closed
 	var redisClient *RedisClient
 	if instanceID != "" && userID != "" {
@@ -456,36 +441,18 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		if err != nil {
 			ap.logger.Warn("Failed to get users from Redis cache", zap.Error(err))
 		} else if cachedUsers != nil {
+			ap.mu.Lock()
 			for _, u := range cachedUsers {
 				ap.users[u.ID] = u
 				ap.usersInv[u.Name] = u.ID
 			}
 			ap.usersReady = true
+			ap.mu.Unlock()
 
 			ap.logger.Info("Loaded users from Redis cache",
 				zap.String("instance_id", instanceID),
 				zap.String("user_id", userID),
 				zap.Int("count", len(cachedUsers)))
-			return nil
-		}
-	}
-
-	// Fall back to file-based cache if Redis cache miss
-	if data, err := ioutil.ReadFile(ap.usersCache); err == nil {
-		var cachedUsers []slack.User
-		if err := json.Unmarshal(data, &cachedUsers); err != nil {
-			ap.logger.Warn("Failed to unmarshal users cache, will refetch",
-				zap.String("cache_file", ap.usersCache),
-				zap.Error(err))
-		} else {
-			for _, u := range cachedUsers {
-				ap.users[u.ID] = u
-				ap.usersInv[u.Name] = u.ID
-			}
-			ap.logger.Info("Loaded users from cache",
-				zap.Int("count", len(cachedUsers)),
-				zap.String("cache_file", ap.usersCache))
-			ap.usersReady = true
 			return nil
 		}
 	}
@@ -496,28 +463,34 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 	if err != nil {
 		ap.logger.Error("Failed to fetch users", zap.Error(err))
 		return err
-	} else {
-		list = append(list, users...)
 	}
 
-	for _, user := range users {
-		ap.users[user.ID] = user
-		ap.usersInv[user.Name] = user.ID
-		usersCounter++
-	}
-
-	users, err = ap.GetSlackConnect(ctx)
+	slackConnectUsers, err := ap.GetSlackConnect(ctx)
 	if err != nil {
 		ap.logger.Error("Failed to fetch users from Slack Connect", zap.Error(err))
 		return err
-	} else {
-		list = append(list, users...)
 	}
 
+	// Prepare all user data before acquiring lock
+	allUsers := make(map[string]slack.User)
+	allUsersInv := make(map[string]string)
+
 	for _, user := range users {
-		ap.users[user.ID] = user
-		ap.usersInv[user.Name] = user.ID
+		allUsers[user.ID] = user
+		allUsersInv[user.Name] = user.ID
 		usersCounter++
+	}
+
+	for _, user := range slackConnectUsers {
+		allUsers[user.ID] = user
+		allUsersInv[user.Name] = user.ID
+		usersCounter++
+	}
+
+	// Create user list for caching
+	var list []slack.User
+	for _, u := range allUsers {
+		list = append(list, u)
 	}
 
 	// Cache to Redis
@@ -530,21 +503,15 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		}
 	}
 
-	if data, err := json.MarshalIndent(list, "", "  "); err != nil {
-		ap.logger.Error("Failed to marshal users for cache", zap.Error(err))
-	} else {
-		if err := ioutil.WriteFile(ap.usersCache, data, 0644); err != nil {
-			ap.logger.Error("Failed to write cache file",
-				zap.String("cache_file", ap.usersCache),
-				zap.Error(err))
-		} else {
-			ap.logger.Info("Wrote users to cache",
-				zap.Int("count", usersCounter),
-				zap.String("cache_file", ap.usersCache))
-		}
-	}
+	ap.logger.Info("Loaded users from API",
+		zap.Int("count", usersCounter))
 
+	// Atomically update the shared state
+	ap.mu.Lock()
+	ap.users = allUsers
+	ap.usersInv = allUsersInv
 	ap.usersReady = true
+	ap.mu.Unlock()
 
 	return nil
 }
@@ -566,6 +533,14 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 		instanceID = teamID
 	}
 
+	if instanceID == "" || userID == "" {
+		ap.logger.Warn("Instance ID or User ID is empty, skipping Redis cache operations",
+			zap.String("instance_id", instanceID),
+			zap.String("user_id", userID),
+			zap.String("team_id", teamID),
+			zap.String("enterprise_id", enterpriseID))
+	}
+
 	// Create Redis client once and ensure it's closed
 	var redisClient *RedisClient
 	if instanceID != "" && userID != "" {
@@ -584,11 +559,13 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 		if err != nil {
 			ap.logger.Warn("Failed to get channels from Redis cache", zap.Error(err))
 		} else if cachedChannels != nil {
+			ap.mu.Lock()
 			for _, c := range cachedChannels {
 				ap.channels[c.ID] = c
 				ap.channelsInv[c.Name] = c.ID
 			}
 			ap.channelsReady = true
+			ap.mu.Unlock()
 
 			ap.logger.Info("Loaded channels from Redis cache",
 				zap.String("instance_id", instanceID),
@@ -598,27 +575,16 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 		}
 	}
 
-	// Fall back to file-based cache if Redis cache miss
-	if data, err := ioutil.ReadFile(ap.channelsCache); err == nil {
-		var cachedChannels []Channel
-		if err := json.Unmarshal(data, &cachedChannels); err != nil {
-			ap.logger.Warn("Failed to unmarshal channels cache, will refetch",
-				zap.String("cache_file", ap.channelsCache),
-				zap.Error(err))
-		} else {
-			for _, c := range cachedChannels {
-				ap.channels[c.ID] = c
-				ap.channelsInv[c.Name] = c.ID
-			}
-			ap.logger.Info("Loaded channels from cache",
-				zap.Int("count", len(cachedChannels)),
-				zap.String("cache_file", ap.channelsCache))
-			ap.channelsReady = true
-			return nil
-		}
-	}
-
 	channels := ap.GetChannels(ctx, AllChanTypes)
+
+	// Prepare channel data before acquiring lock
+	allChannels := make(map[string]Channel)
+	allChannelsInv := make(map[string]string)
+
+	for _, c := range channels {
+		allChannels[c.ID] = c
+		allChannelsInv[c.Name] = c.ID
+	}
 
 	// Cache to Redis
 	if redisClient != nil {
@@ -630,21 +596,15 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 		}
 	}
 
-	if data, err := json.MarshalIndent(channels, "", "  "); err != nil {
-		ap.logger.Error("Failed to marshal channels for cache", zap.Error(err))
-	} else {
-		if err := ioutil.WriteFile(ap.channelsCache, data, 0644); err != nil {
-			ap.logger.Error("Failed to write cache file",
-				zap.String("cache_file", ap.channelsCache),
-				zap.Error(err))
-		} else {
-			ap.logger.Info("Wrote channels to cache",
-				zap.Int("count", len(channels)),
-				zap.String("cache_file", ap.channelsCache))
-		}
-	}
+	ap.logger.Info("Loaded channels from API",
+		zap.Int("count", len(channels)))
 
+	// Atomically update the shared state
+	ap.mu.Lock()
+	ap.channels = allChannels
+	ap.channelsInv = allChannelsInv
 	ap.channelsReady = true
+	ap.mu.Unlock()
 
 	return nil
 }
@@ -684,9 +644,13 @@ func (ap *ApiProvider) GetSlackConnect(ctx context.Context) ([]slack.User, error
 	return res, nil
 }
 
-func (ap *ApiProvider) GetChannelsType(ctx context.Context, channelType string) []Channel {
+func (ap *ApiProvider) GetChannels(ctx context.Context, channelTypes []string) []Channel {
+	if len(channelTypes) == 0 {
+		channelTypes = AllChanTypes
+	}
+
 	params := &slack.GetConversationsParameters{
-		Types:           []string{channelType},
+		Types:           AllChanTypes,
 		Limit:           999,
 		ExcludeArchived: true,
 	}
@@ -706,10 +670,6 @@ func (ap *ApiProvider) GetChannelsType(ctx context.Context, channelType string) 
 		}
 
 		channels, nextcur, err = ap.client.GetConversationsContext(ctx, params)
-		ap.logger.Debug("Fetched channels for ",
-			zap.String("channelType", channelType),
-			zap.Int("count", len(channels)),
-		)
 		if err != nil {
 			ap.logger.Error("Failed to fetch channels", zap.Error(err))
 			break
@@ -734,29 +694,16 @@ func (ap *ApiProvider) GetChannelsType(ctx context.Context, channelType string) 
 			chans = append(chans, ch)
 		}
 
+		for _, ch := range chans {
+			ap.channels[ch.ID] = ch
+			ap.channelsInv[ch.Name] = ch.ID
+		}
+
 		if nextcur == "" {
 			break
 		}
 
 		params.Cursor = nextcur
-	}
-	return chans
-}
-
-func (ap *ApiProvider) GetChannels(ctx context.Context, channelTypes []string) []Channel {
-	if len(channelTypes) == 0 {
-		channelTypes = AllChanTypes
-	}
-
-	var chans []Channel
-	for _, t := range AllChanTypes {
-		var typeChannels = ap.GetChannelsType(ctx, t)
-		chans = append(chans, typeChannels...)
-	}
-
-	for _, ch := range chans {
-		ap.channels[ch.ID] = ch
-		ap.channelsInv[ch.Name] = ch.ID
 	}
 
 	var res []Channel
@@ -781,6 +728,9 @@ func (ap *ApiProvider) GetChannels(ctx context.Context, channelTypes []string) [
 }
 
 func (ap *ApiProvider) ProvideUsersMap() *UsersCache {
+	ap.mu.RLock()
+	defer ap.mu.RUnlock()
+
 	return &UsersCache{
 		Users:    ap.users,
 		UsersInv: ap.usersInv,
@@ -788,6 +738,9 @@ func (ap *ApiProvider) ProvideUsersMap() *UsersCache {
 }
 
 func (ap *ApiProvider) ProvideChannelsMaps() *ChannelsCache {
+	ap.mu.RLock()
+	defer ap.mu.RUnlock()
+
 	return &ChannelsCache{
 		Channels:    ap.channels,
 		ChannelsInv: ap.channelsInv,
@@ -795,6 +748,9 @@ func (ap *ApiProvider) ProvideChannelsMaps() *ChannelsCache {
 }
 
 func (ap *ApiProvider) IsReady() (bool, error) {
+	ap.mu.RLock()
+	defer ap.mu.RUnlock()
+
 	if !ap.usersReady {
 		return false, ErrUsersNotReady
 	}

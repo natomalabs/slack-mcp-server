@@ -98,6 +98,8 @@ type ApiProvider struct {
 	channelsInv   map[string]string
 	channelsCache string
 	channelsReady bool
+
+	redisClient *RedisClient
 }
 
 func NewMCPSlackClient(authProvider auth.Provider, logger *zap.Logger) (*MCPSlackClient, error) {
@@ -281,6 +283,21 @@ func (c *MCPSlackClient) Raw() struct {
 	}
 }
 
+// getRedisClient returns a Redis client for the given instance ID and user ID, creating it if necessary
+func (ap *ApiProvider) getRedisClient(instanceID string, userID string) (*RedisClient, error) {
+	if instanceID == "" || userID == "" {
+		return nil, nil
+	}
+
+	// Check if Redis is configured
+	if os.Getenv("REDIS_ADDR") == "" && os.Getenv("REDIS_PASSWORD") == "" && os.Getenv("REDIS_DB") == "" {
+		return nil, nil
+	}
+
+	// For now, create a new client each time. In the future, we could cache clients by instanceID/userID
+	return NewRedisClient(ap.logger, instanceID, userID)
+}
+
 func New(transport string, logger *zap.Logger) *ApiProvider {
 	var (
 		authProvider auth.ValueAuth
@@ -405,6 +422,55 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		optionLimit  = slack.GetUsersOptionLimit(1000)
 	)
 
+	// Get team ID, user ID, and enterprise ID for cache partitioning
+	authResp, err := ap.client.AuthTest()
+	if err != nil {
+		ap.logger.Error("Failed to get auth test for team ID", zap.Error(err))
+		return err
+	}
+	teamID := authResp.TeamID
+	userID := authResp.UserID
+	enterpriseID := authResp.EnterpriseID
+	
+	// Use enterpriseID as instanceID if available, otherwise use teamID
+	instanceID := enterpriseID
+	if instanceID == "" {
+		instanceID = teamID
+	}
+	
+	// Create Redis client once and ensure it's closed
+	var redisClient *RedisClient
+	if instanceID != "" && userID != "" {
+		redisClient, err = ap.getRedisClient(instanceID, userID)
+		if err != nil {
+			ap.logger.Error("Failed to create Redis client", zap.Error(err))
+		}
+		if redisClient != nil {
+			defer redisClient.Close() // Ensure Redis client is closed to prevent connection leaks
+		}
+	}
+
+	// Try to load from Redis cache first
+	if redisClient != nil {
+		cachedUsers, err := redisClient.GetUsers(ctx)
+		if err != nil {
+			ap.logger.Warn("Failed to get users from Redis cache", zap.Error(err))
+		} else if cachedUsers != nil {
+			for _, u := range cachedUsers {
+				ap.users[u.ID] = u
+				ap.usersInv[u.Name] = u.ID
+			}
+			ap.usersReady = true
+
+			ap.logger.Info("Loaded users from Redis cache",
+				zap.String("instance_id", instanceID),
+				zap.String("user_id", userID),
+				zap.Int("count", len(cachedUsers)))
+			return nil
+		}
+	}
+
+	// Fall back to file-based cache if Redis cache miss
 	if data, err := ioutil.ReadFile(ap.usersCache); err == nil {
 		var cachedUsers []slack.User
 		if err := json.Unmarshal(data, &cachedUsers); err != nil {
@@ -454,6 +520,16 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 		usersCounter++
 	}
 
+	// Cache to Redis
+	if redisClient != nil {
+		if err := redisClient.SetUsers(ctx, list); err != nil {
+			ap.logger.Error("Failed to cache users to Redis",
+				zap.String("instance_id", instanceID),
+				zap.String("user_id", userID),
+				zap.Error(err))
+		}
+	}
+
 	if data, err := json.MarshalIndent(list, "", "  "); err != nil {
 		ap.logger.Error("Failed to marshal users for cache", zap.Error(err))
 	} else {
@@ -474,6 +550,55 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 }
 
 func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
+	// Get team ID, user ID, and enterprise ID for cache partitioning
+	authResp, err := ap.client.AuthTest()
+	if err != nil {
+		ap.logger.Error("Failed to get auth test for team ID", zap.Error(err))
+		return err
+	}
+	teamID := authResp.TeamID
+	userID := authResp.UserID
+	enterpriseID := authResp.EnterpriseID
+	
+	// Use enterpriseID as instanceID if available, otherwise use teamID
+	instanceID := enterpriseID
+	if instanceID == "" {
+		instanceID = teamID
+	}
+	
+	// Create Redis client once and ensure it's closed
+	var redisClient *RedisClient
+	if instanceID != "" && userID != "" {
+		redisClient, err = ap.getRedisClient(instanceID, userID)
+		if err != nil {
+			ap.logger.Error("Failed to create Redis client", zap.Error(err))
+		}
+		if redisClient != nil {
+			defer redisClient.Close() // Ensure Redis client is closed to prevent connection leaks
+		}
+	}
+
+	// Try to load from Redis cache first
+	if redisClient != nil {
+		cachedChannels, err := redisClient.GetChannels(ctx)
+		if err != nil {
+			ap.logger.Warn("Failed to get channels from Redis cache", zap.Error(err))
+		} else if cachedChannels != nil {
+			for _, c := range cachedChannels {
+				ap.channels[c.ID] = c
+				ap.channelsInv[c.Name] = c.ID
+			}
+			ap.channelsReady = true
+
+			ap.logger.Info("Loaded channels from Redis cache",
+				zap.String("instance_id", instanceID),
+				zap.String("user_id", userID),
+				zap.Int("count", len(cachedChannels)))
+			return nil
+		}
+	}
+
+	// Fall back to file-based cache if Redis cache miss
 	if data, err := ioutil.ReadFile(ap.channelsCache); err == nil {
 		var cachedChannels []Channel
 		if err := json.Unmarshal(data, &cachedChannels); err != nil {
@@ -494,6 +619,16 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 	}
 
 	channels := ap.GetChannels(ctx, AllChanTypes)
+
+	// Cache to Redis
+	if redisClient != nil {
+		if err := redisClient.SetChannels(ctx, channels); err != nil {
+			ap.logger.Error("Failed to cache channels to Redis",
+				zap.String("instance_id", instanceID),
+				zap.String("user_id", userID),
+				zap.Error(err))
+		}
+	}
 
 	if data, err := json.MarshalIndent(channels, "", "  "); err != nil {
 		ap.logger.Error("Failed to marshal channels for cache", zap.Error(err))

@@ -431,13 +431,13 @@ func (ap *ApiProvider) RefreshUsers(ctx context.Context) error {
 	teamID := authResp.TeamID
 	userID := authResp.UserID
 	enterpriseID := authResp.EnterpriseID
-	
+
 	// Use enterpriseID as instanceID if available, otherwise use teamID
 	instanceID := enterpriseID
 	if instanceID == "" {
 		instanceID = teamID
 	}
-	
+
 	// Create Redis client once and ensure it's closed
 	var redisClient *RedisClient
 	if instanceID != "" && userID != "" {
@@ -559,13 +559,13 @@ func (ap *ApiProvider) RefreshChannels(ctx context.Context) error {
 	teamID := authResp.TeamID
 	userID := authResp.UserID
 	enterpriseID := authResp.EnterpriseID
-	
+
 	// Use enterpriseID as instanceID if available, otherwise use teamID
 	instanceID := enterpriseID
 	if instanceID == "" {
 		instanceID = teamID
 	}
-	
+
 	// Create Redis client once and ensure it's closed
 	var redisClient *RedisClient
 	if instanceID != "" && userID != "" {
